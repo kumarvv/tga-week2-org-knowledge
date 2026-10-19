@@ -102,8 +102,6 @@ def query_graph(config: Config, question: str, *, callbacks=None) -> AIMessage:
  {context}"""),
         ("human", "{question}"),
     ])
-
-    print(f"\n\n\nCONTEXT:\n>>>>>{context}\n<<<<<<\n\n\n")
     
     llm = ChatOpenAI(model=config.reasoning_model, streaming=bool(callbacks))
     return llm.invoke(
@@ -118,7 +116,6 @@ def main() -> None:
         "Who worked on Atlas Knowledge Hub, and what relevant skills did they bring to the project?"
     )
     response = query_graph(config=get_config(), question=question)
-    print(f"\n\nAI RESPONSE:\n")
     print(response.content)
 
 

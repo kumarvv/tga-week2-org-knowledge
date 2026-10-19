@@ -123,7 +123,7 @@ def print_table(rows: list[list[str]], answer_width: int = 42) -> None:
         print(border)
 
 
-def write_comparison(rows: list[list[str]], output_path: str | Path = "Comparision.md") -> Path:
+def write_comparison(rows: list[list[str]], output_path: str | Path = "Comparison.md") -> Path:
     """Write a summary, executed questions, and full results as Markdown."""
     def cell(value: str) -> str:
         return (str(value).replace("&", "&amp;").replace("<", "&lt;")
@@ -148,9 +148,19 @@ def write_comparison(rows: list[list[str]], output_path: str | Path = "Comparisi
         "", "## Questions run", "",
         *[f"{index}. {cell(row[0])}" for index, row in enumerate(rows, start=1)],
         "", "## Comparison table", "",
-        "| Question | RAG Vector | RAG Graph | Time to first token | Total Time | Which Approach Wins |",
-        "| --- | --- | --- | --- | --- | --- |",
-        *["| " + " | ".join(cell(value) for value in row) + " |" for row in rows],
+        "<table>",
+        '<tr valign="top">',
+        *[f"<th>{header}</th>" for header in (
+            "Question", "RAG Vector", "RAG Graph", "Time to first token",
+            "Total Time", "Which Approach Wins",
+        )],
+        "</tr>",
+        *[line for row in rows for line in (
+            '<tr valign="top">',
+            *[f"<td>{cell(value)}</td>" for value in row],
+            "</tr>",
+        )],
+        "</table>",
         "",
     ]
     path = Path(output_path)
