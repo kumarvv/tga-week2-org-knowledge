@@ -7,6 +7,10 @@ Compare answers to organizational knowledge questions using the same mock data a
 
 `compare.py` currently compares **Chroma against Neo4j**. It measures latency and uses an LLM judge to assess answer quality against the original mock data.
 
+## Architecture
+
+![Alt text](/Architecture.jpg?raw=true "Architecture")
+
 ## 1. Set up the environment
 
 Prerequisites:
