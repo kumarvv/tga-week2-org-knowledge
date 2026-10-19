@@ -148,7 +148,7 @@ def write_comparison(rows: list[list[str]], output_path: str | Path = "Compariso
         "", "## Questions run", "",
         *[f"{index}. {cell(row[0])}" for index, row in enumerate(rows, start=1)],
         "", "## Comparison table", "",
-        "<table>",
+        "<table border=\"1\">",
         '<tr valign="top">',
         *[f"<th>{header}</th>" for header in (
             "Question", "RAG Vector", "RAG Graph", "Time to first token",
