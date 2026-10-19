@@ -1,15 +1,15 @@
-"""Embed the organization mock data and store it in Pinecone."""
 
-import argparse
+"""Load organization entities, relationships, and embeddings into Neo4j."""
+
 import os
-from collections import Counter
-from typing import Any
-from dotenv import load_dotenv
+import re
+from collections import defaultdict
 
-from langchain_core.documents import Document
+from dotenv import load_dotenv
 from langchain_openai import OpenAIEmbeddings
-from langchain_pinecone import Pinecone as PineconeVectorStore
-from pinecone import Pinecone 
+from neo4j import GraphDatabase, Driver
+
+from configs import Config, get_config
 
 from mock_data.decisions import DECISIONS
 from mock_data.documents import DOCUMENTS
@@ -17,160 +17,152 @@ from mock_data.people import PEOPLE
 from mock_data.projects import PROJECTS
 from mock_data.skills import SKILLS
 
-MODEL = "llama-text-embed-v2"
-TEXT_FIELD = "text"
-
 load_dotenv()
 
-def build_recordsX() -> list[dict[str, Any]]:
-    """Build flat Pinecone records, using existing chunks for documents."""
-    records = []
-    for entity in [*PEOPLE, *SKILLS, *PROJECTS, *DOCUMENTS, *DECISIONS]:
-        metadata = {
-            key: value
-            for key, value in entity.items()
-            if isinstance(value, (str, int, float, bool))
-            and key not in {"id", "retrieval_text", "content"}
-        }
-        metadata["entity_id"] = entity["id"]
-        for key, value in entity.get("access", {}).items():
-            metadata[key] = value
-        # Keep relationship targets available for filtering and graph lookups.
-        for relation in entity.get("relationships", []):
-            key = relation["type"].lower() + "_ids"
-            metadata.setdefault(key, []).append(relation["target_id"])
+ENTITY_GROUPS = {
+    "People": PEOPLE,
+    "Skills": SKILLS,
+    "Projects": PROJECTS,
+    "Documents": DOCUMENTS,
+    "Decisions": DECISIONS,
+}
 
-        chunks = entity.get("chunks", [])
-        if chunks:
-            for chunk in chunks:
-                records.append({
-                    **metadata,
-                    "_id": f"document:{entity['id']}:{chunk['id']}",
-                    "document_id": entity["id"],
-                    "chunk_id": chunk["id"],
-                    "heading": chunk["heading"],
-                    TEXT_FIELD: f"{entity['name']}\n{chunk['heading']}\n{chunk['text']}",
+def get_neo4j_driver() -> Driver:
+    """Initializes and returns the Neo4j driver."""
+    uri = os.getenv("NEO4J_URI")
+    user = os.getenv("NEO4J_USERNAME")
+    password = os.getenv("NEO4J_PASSWORD")
+
+    return GraphDatabase.driver(uri, auth=(user, password))
+
+def setup_neo4j_constraints(driver: Driver):
+    """Adds unique constraints to the Neo4j database to prevent duplicate nodes."""
+    with driver.session(database="neo4j") as session:
+        session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:People) REQUIRE c.id IS UNIQUE")
+        session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Skills) REQUIRE c.id IS UNIQUE")
+        session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (r:Projects) REQUIRE r.id IS UNIQUE")
+        session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (s:Documents) REQUIRE s.id IS UNIQUE")
+        session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (s:Decisions) REQUIRE s.id IS UNIQUE")
+        session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE")
+    print("Neo4j constraints are set.")
+
+def create_vector_index(driver: Driver, embedding_model):
+    """Create a cosine vector index for each imported entity label."""
+    vector_dimensions = len(embedding_model.embed_query("sample"))
+    if not vector_dimensions:
+        raise ValueError("The embedding model returned an empty vector")
+
+    with driver.session(database="neo4j") as session:
+        for label in ENTITY_GROUPS:
+            session.run(f"""
+                CREATE VECTOR INDEX `org_knowledge_{label.lower()}` IF NOT EXISTS
+                FOR (n:{label}) ON (n.embedding)
+                OPTIONS {{ indexConfig: {{
+                    `vector.dimensions`: {vector_dimensions},
+                    `vector.similarity_function`: 'cosine'
+                }} }}
+            """).consume()
+    print("Vector indexes for all five entity labels are set.")
+
+
+def ingest_data(driver: Driver, embedding_model) -> None:
+    """Upsert all mock entities, embeddings, chunks, and directed relationships.
+
+    Flatten document access metadata onto Documents nodes and store skill
+    proficiency as the level property of HAS_SKILL relationships.
+    """
+    labels_by_id = {}
+    for label, entities in ENTITY_GROUPS.items():
+        for entity in entities:
+            if entity["id"] in labels_by_id:
+                raise ValueError(f"Duplicate entity ID: {entity['id']}")
+            labels_by_id[entity["id"]] = label
+
+    nodes = defaultdict(list)
+    relationships = defaultdict(list)
+    chunks = []
+    for label, entities in ENTITY_GROUPS.items():
+        for entity in entities:
+            levels = {
+                item["skill_id"]: item["level"]
+                for item in entity.get("skill_proficiencies", [])
+            }
+            for relationship in entity.get("relationships", []):
+                kind = relationship["type"]
+                if not re.fullmatch(r"[A-Z][A-Z0-9_]*", kind):
+                    raise ValueError(f"Invalid relationship type: {kind}")
+                target_id = relationship["target_id"]
+                if target_id not in labels_by_id:
+                    raise ValueError(f"Unknown relationship target: {target_id}")
+                properties = {}
+                if kind == "HAS_SKILL" and target_id in levels:
+                    properties["level"] = levels[target_id]
+                relationships[(label, kind, labels_by_id[target_id])].append({
+                    "source_id": entity["id"],
+                    "target_id": target_id,
+                    "properties": properties,
                 })
-        else:
-            records.append({
-                **metadata,
-                "_id": f"{entity['entity_type']}:{entity['id']}",
-                TEXT_FIELD: entity["retrieval_text"],
-            })
+            properties = {
+                key: value for key, value in entity.items()
+                if key not in {"relationships", "skill_proficiencies", "access", "chunks"}
+            }
+            properties.update(entity.get("access", {}))
+            nodes[label].append(properties)
+            chunks.extend(entity.get("chunks", []))
 
-    ids = [record["_id"] for record in records]
-    if len(ids) != len(set(ids)):
-        raise ValueError("Duplicate vector IDs in mock data")
-    if any(not record[TEXT_FIELD].strip() for record in records):
-        raise ValueError("Every record must have non-empty embedding text")
-    return records
+    # Embed before opening the write transaction so API failures leave no partial load.
+    for properties in nodes.values():
+        vectors = embedding_model.embed_documents([
+            item["retrieval_text"] for item in properties
+        ])
+        if len(vectors) != len(properties):
+            raise ValueError("The embedding model returned the wrong number of vectors")
+        for item, vector in zip(properties, vectors):
+            if not vector:
+                raise ValueError(f"Empty embedding for {item['id']}")
+            item["embedding"] = vector
 
-def build_records() -> list[dict[str, Any]]:
-    """Build flat Pinecone records, using existing chunks for documents."""
-    records = []
-    for entity in [*PEOPLE, *SKILLS, *PROJECTS, *DOCUMENTS, *DECISIONS]:
-        metadata = {
-            key: value
-            for key, value in entity.items()
-            if isinstance(value, (str, int, float, bool))
-            and key not in {"id", "retrieval_text", "content"}
-        }
-        metadata["entity_id"] = entity["id"]
-        for key, value in entity.get("access", {}).items():
-            metadata[key] = value
+    def write_graph(tx):
+        for label, rows in nodes.items():
+            tx.run(f"""
+                UNWIND $rows AS row
+                MERGE (n:{label} {{id: row.id}})
+                SET n += row
+            """, rows=rows).consume()
+        tx.run("""
+            UNWIND $rows AS row
+            MATCH (d:Documents {id: row.document_id})
+            MERGE (c:Chunk {id: row.id})
+            SET c += row
+            MERGE (d)-[:HAS_CHUNK]->(c)
+        """, rows=chunks).consume()
+        for (source, kind, target), rows in relationships.items():
+            tx.run(f"""
+                UNWIND $rows AS row
+                MATCH (source:{source} {{id: row.source_id}})
+                MATCH (target:{target} {{id: row.target_id}})
+                MERGE (source)-[r:{kind}]->(target)
+                SET r += row.properties
+            """, rows=rows).consume()
 
-        chunks = entity.get("chunks", [])
-        if chunks:
-            for chunk in chunks:
-                records.append({
-                    "id": f"document:{entity['id']}:{chunk['id']}",
-                    "document_id": entity["id"],
-                    "chunk_id": chunk["id"],
-                    "heading": chunk["heading"],
-                    TEXT_FIELD: f"{entity['name']}\n{chunk['heading']}\n{chunk['text']}",
-                    "entity_type": metadata["entity_type"],
-                    "metadata": metadata,
-                })
-        else:
-            records.append({
-                "id": f"{entity['entity_type']}:{entity['id']}",
-                TEXT_FIELD: entity["retrieval_text"],
-                "entity_type": metadata["entity_type"],
-                "metadata": metadata,
-            })
-
-    ids = [record["id"] for record in records]
-    if len(ids) != len(set(ids)):
-        raise ValueError("Duplicate vector IDs in mock data")
-    if any(not record[TEXT_FIELD].strip() for record in records):
-        raise ValueError("Every record must have non-empty embedding text")
-    return records
-
-
-def build_documents(records: list[dict[str, Any]]) -> list[Document]:
-    """Convert records to LangChain documents while retaining stable IDs."""
-    return [
-        Document(
-            id=record["id"],
-            page_content=record[TEXT_FIELD],
-            metadata={
-                **record["metadata"],
-                **{
-                    key: record[key]
-                    for key in ("document_id", "chunk_id", "heading")
-                    if key in record
-                },
-            },
-        )
-        for record in records
-    ]
+    with driver.session(database="neo4j") as session:
+        session.execute_write(write_graph)
+    print(f"Ingested {len(labels_by_id)} entities into Neo4j.")
 
 
 def main() -> None:
-    """Embed mock records with OpenAI and upload to an existing Pinecone index."""
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--index", default=os.getenv("PINECONE_INDEX", "org-knowledge"))
-    parser.add_argument("--namespace", default=os.getenv("PINECONE_NAMESPACE", "mock-data"))
-    parser.add_argument("--cloud", default=os.getenv("PINECONE_CLOUD", "aws"))
-    parser.add_argument("--region", default=os.getenv("PINECONE_REGION", "us-east-1"))
-    parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--dry-run", action="store_true", help="Validate records without API calls")
-    args = parser.parse_args()
-    if not 1 <= args.batch_size <= 96:
-        parser.error("--batch-size must be between 1 and 96")
-    if not args.namespace.strip():
-        parser.error("--namespace must not be empty")
-
-    records = build_records()
-    counts = Counter(record["entity_type"] for record in records)
-    print(f"Prepared {len(records)} records: {dict(counts)}")
-    if args.dry_run:
-        return
-
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small", dimensions=1024)
-
-    pc = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
-    index = pc.Index(args.index)
-
-    vector_store = PineconeVectorStore(
-        index=index, 
-        embedding=embeddings,
-        namespace=args.namespace
+    """Initialize the graph schema and ingest the organization mock data."""
+    config = get_config(Config())
+    embeddings = OpenAIEmbeddings(
+        model=config.embeddings_model,
+        dimensions=config.embeddings_dimensions,
     )
+    with get_neo4j_driver() as driver:
+        driver.verify_connectivity()
+        setup_neo4j_constraints(driver)
+        create_vector_index(driver, embeddings)
+        ingest_data(driver, embeddings)
 
-    print(f"Indexing {len(records)} records")
-    
-    documents = build_documents(records)
-    
-    ### ONETIME RUN ONLY -- UNCOMMENT WHEN NEEDED 
-    # record_ids = vector_store.add_documents(
-    #     documents=documents,
-    #     ids=[document.id for document in documents],
-    #     batch_size=args.batch_size,
-    # )
-
-    print(f"Index complete: {len(documents)} records.")
-    
 
 if __name__ == "__main__":
     main()

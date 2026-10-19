@@ -10,7 +10,7 @@ from configs import Config, get_config, CHROMA_PERSIST_DIR
 
 load_dotenv()
 
-def query_vector_chroma(config: Config, question: str) -> AIMessage: 
+def query_vector_chroma(config: Config, question: str, *, callbacks=None) -> AIMessage:
     embeddings = OpenAIEmbeddings(model=config.embeddings_model, dimensions=config.embeddings_dimensions)  # 512-dim vectors
 
     vector_store = Chroma(
@@ -32,18 +32,18 @@ def query_vector_chroma(config: Config, question: str) -> AIMessage:
     retrieved_docs = vector_retriever.invoke(question)
 
     # response 
-    llm = ChatOpenAI(model=config.reasoning_model)
+    llm = ChatOpenAI(model=config.reasoning_model, streaming=bool(callbacks))
 
     docs_content = "\n\n".join(doc.page_content for doc in retrieved_docs)
     prompt = RAG_TEMPLATE.invoke({"question": question, "context": docs_content})
 
-    response = llm.invoke(prompt)
+    response = llm.invoke(prompt, config={"callbacks": callbacks or []})
 
     return response
 
 
 def main(): 
-    question = "What documents has Elena Rossi written about search quality, and what evidence or evaluation methods do they contain?"
+    question = "Who worked on Atlas Knowledge Hub, and what relevant skills did they bring to the project?"
     config = get_config()
 
     response = query_vector_chroma(config=config, question=question)

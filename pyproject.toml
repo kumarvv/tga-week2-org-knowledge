@@ -19,10 +19,12 @@ dependencies = [
     "jupyter>=1.0.0",
     "langgraph-cli[inmem]>=0.4.0",
     "langchain-mcp-adapters",
-    "pinecone>=10,<11",
-    "langchain-pinecone>=0.0.1",
+    "pinecone>=7,<8",
+    "langchain-pinecone>=0.2.13,<0.3",
     "chromadb>=1.5.9",
     "langchain-chroma>=1.1.0",
+    "langchain-neo4j>=0.9.0",
+    "neo4j>=6.4.1",
 ]
 
 [project.optional-dependencies]
